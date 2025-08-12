@@ -72,14 +72,12 @@ async function upsertPanel() {
 
   const panelEmbed = new EmbedBuilder()
     .setTitle('Submit a Suggestion')
-    .setDescription([
-      'Click a button to open the form.',
-      '',
-      '• **Submit (with name)** posts your Discord tag with the suggestion.',
-      '• **Submit Anonymously** hides your identity in the posted message.'
-    ].join('
-'))
-    .setColor(0x5865F2);
+    .setDescription(
+      `Click a button to open the form.
+
+    • **Submit (with name)** posts your Discord tag with the suggestion.
+    • **Submit Anonymously** hides your identity in the posted message.`
+  )
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('fb_open:public').setLabel('Submit (with name)').setStyle(ButtonStyle.Primary),
