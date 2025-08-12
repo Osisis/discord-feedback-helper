@@ -119,11 +119,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const out = await guild.channels.fetch(suggestionsChannelId);
       if (!out?.isTextBased()) return interaction.reply({ content: 'Config error: target suggestions channel is invalid.', flags: MessageFlags.Ephemeral });
 
-      const embed = new EmbedBuilder()
-        .setTitle('New Suggestion')
-        .setDescription(text)
-        .setTimestamp(new Date())
-        .setFooter({ text: anon ? 'Submitted anonymously' : `Submitted by ${interaction.user.tag}` });
+      // Work out a human-friendly server display name (nickname > server display > global > username)
+const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+const displayName = member?.nickname || member?.displayName || interaction.user.globalName || interaction.user.username;
+
+const embed = new EmbedBuilder()
+  .setTitle('New Suggestion')
+  .setDescription(text)
+  .setTimestamp(new Date())
+  .setFooter({ text: anon ? 'Submitted anonymously' : `Submitted by ${displayName}` });
 
       const message = await out.send({ embeds: [embed] });
 
