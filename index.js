@@ -23,8 +23,8 @@ import {
 const token = process.env.DISCORD_TOKEN;
 const appId = process.env.APP_ID;
 const guildId = process.env.GUILD_ID;
-const formChannelId = process.env.FORM_CHANNEL_ID;              // Channel that shows the panel with buttons
-const suggestionsChannelId = process.env.SUGGESTIONS_CHANNEL_ID; // Channel where suggestions are posted
+const formChannelId = process.env.FORM_CHANNEL_ID; // Panel lives here
+const suggestionsChannelId = process.env.SUGGESTIONS_CHANNEL_ID; // Suggestions are posted here
 
 if (!token || !appId || !guildId || !formChannelId || !suggestionsChannelId) {
   console.error('Missing env vars. Required: DISCORD_TOKEN, APP_ID, GUILD_ID, FORM_CHANNEL_ID, SUGGESTIONS_CHANNEL_ID');
@@ -58,11 +58,12 @@ async function upsertPanel() {
 
   const panelEmbed = new EmbedBuilder()
     .setTitle('Submit a Suggestion')
-    .setDescription(
-      'Click a button to open the form.\n\n' +
-      '• **Submit (with name)** posts your Discord tag with the suggestion.\n' +
+    .setDescription([
+      'Click a button to open the form.',
+      '',
+      '• **Submit (with name)** posts your Discord tag with the suggestion.',
       '• **Submit Anonymously** hides your identity in the posted message.'
-    )
+    ].join('\n'))
     .setColor(0x5865F2);
 
   const row = new ActionRowBuilder().addComponents(
@@ -126,17 +127,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const message = await out.send({ embeds: [embed] });
 
-      // Emoji voting — add reactions then remove bot's own to start at 0
+      // Emoji voting — add 👍/👎 and remove the bot's own reactions so counts start at 0
       try {
         await message.react('👍');
         await message.react('👎');
-        const removeOwn = async (emoji) => {
+        const ensureRemoved = async (emoji) => {
           try {
-            const reaction = message.reactions.cache.get(emoji) || (await message.fetch()).reactions.cache.get(emoji);
-            if (reaction) await reaction.users.remove(client.user.id);
-          } catch {}
+            const current = message.reactions.cache.get(emoji) || (await message.fetch()).reactions.cache.get(emoji);
+            if (current) await current.users.remove(client.user.id);
+          } catch (err) {
+            console.warn(`Could not remove own reaction for ${emoji}:`, err?.message || err);
+          }
         };
-        await Promise.allSettled([removeOwn('👍'), removeOwn('👎')]);
+        await Promise.allSettled([ensureRemoved('👍'), ensureRemoved('👎')]);
       } catch (e) {
         console.warn('Could not add/remove reactions (check permissions):', e?.message || e);
       }
