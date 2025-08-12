@@ -11,25 +11,27 @@ import {
   ModalBuilder,
   REST,
   Routes,
-  SlashCommandBuilder, // kept in case you ever want /feedback again, but not required
+  SlashCommandBuilder, // optional; keep if you want /feedback available too
   TextInputBuilder,
   TextInputStyle,
 } from 'discord.js';
 
+// === Env Vars ===
 const token = process.env.DISCORD_TOKEN;
 const appId = process.env.APP_ID;
 const guildId = process.env.GUILD_ID;
-const formChannelId = process.env.FORM_CHANNEL_ID;           // NEW: where the panel lives
-const suggestionsChannelId = process.env.SUGGESTIONS_CHANNEL_ID;
+const formChannelId = process.env.FORM_CHANNEL_ID;           // Channel that shows the panel with buttons
+const suggestionsChannelId = process.env.SUGGESTIONS_CHANNEL_ID; // Channel where suggestions are posted
 
 if (!token || !appId || !guildId || !formChannelId || !suggestionsChannelId) {
-  console.error('Missing env vars. Check DISCORD_TOKEN, APP_ID, GUILD_ID, FORM_CHANNEL_ID, SUGGESTIONS_CHANNEL_ID');
+  console.error('Missing env vars. Required: DISCORD_TOKEN, APP_ID, GUILD_ID, FORM_CHANNEL_ID, SUGGESTIONS_CHANNEL_ID');
   process.exit(1);
 }
 
+// === Client ===
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// (Optional) still deploy /feedback if you want, but not required anymore
+// === (Optional) Deploy /feedback command — not required for panel-only UX ===
 async function deployCommands() {
   const rest = new REST({ version: '10' }).setToken(token);
   const commands = [
@@ -43,7 +45,7 @@ async function deployCommands() {
   console.log('Slash commands deployed (guild).');
 }
 
-// Create or refresh the static panel message with buttons
+// === Post/refresh the static panel in the form channel ===
 async function upsertPanel() {
   const guild = await client.guilds.fetch(guildId);
   const channel = await guild.channels.fetch(formChannelId);
@@ -71,7 +73,7 @@ async function upsertPanel() {
       .setStyle(ButtonStyle.Secondary),
   );
 
-  // Clean up old panels the bot posted recently (avoid duplicates on redeploy)
+  // Clean up older panels to avoid duplicates on redeploys
   const recent = await channel.messages.fetch({ limit: 20 }).catch(() => null);
   if (recent) {
     const mine = recent.filter(m =>
@@ -84,14 +86,15 @@ async function upsertPanel() {
   }
 
   const msg = await channel.send({ embeds: [panelEmbed], components: [row] });
-  try { await msg.pin(); } catch {} // best-effort pin (requires permission)
+  try { await msg.pin(); } catch {} // best-effort; requires Manage Messages permission
   console.log(`Feedback panel posted in #${channel.name} (${channel.id}).`);
 }
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   try {
-    await deployCommands();  // harmless if you keep it; remove if you truly want no slash cmds
+    // Optional: keeping /feedback available; remove this call if you truly want no slash commands at all
+    await deployCommands();
   } catch (e) {
     console.warn('Deploy commands failed (ok if not needed):', e?.message || e);
   }
@@ -102,10 +105,9 @@ client.once(Events.ClientReady, async (c) => {
   }
 });
 
-// Interactions: buttons → modal; modal → post to suggestions channel
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    // (Optional) /feedback still works, but users won’t need it
+    // (Optional) /feedback → show the same buttons ephemerally
     if (interaction.isChatInputCommand() && interaction.commandName === 'feedback') {
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('fb_open:public').setLabel('Submit (with name)').setStyle(ButtonStyle.Primary),
@@ -134,13 +136,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.showModal(modal);
     }
 
-    // Modal submit → post to suggestions channel
+    // Modal submit → post to suggestions channel + add emoji reactions for voting
     if (interaction.isModalSubmit() && interaction.customId.startsWith('fb_modal:')) {
       const anon = interaction.customId.endsWith(':1');
       const text = interaction.fields.getTextInputValue('text')?.trim();
       if (!text) {
         return interaction.reply({ content: 'Please include some text.', ephemeral: true });
-      }
+        }
 
       const guild = await client.guilds.fetch(guildId);
       const out = await guild.channels.fetch(suggestionsChannelId);
@@ -154,7 +156,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setTimestamp(new Date())
         .setFooter({ text: anon ? 'Submitted anonymously' : `Submitted by ${interaction.user.tag}` });
 
-      await out.send({ embeds: [embed] });
+      // Send the suggestion and capture the message for voting reactions
+      const message = await out.send({ embeds: [embed] });
+
+      // === Emoji Voting (Option 1) ===
+      try {
+        await message.react('👍');
+        await message.react('👎');
+      } catch (e) {
+        console.warn('Could not add reactions (check permissions):', e?.message || e);
+      }
+
       return interaction.reply({ content: 'Thanks! Your suggestion was submitted.', ephemeral: true });
     }
   } catch (err) {
