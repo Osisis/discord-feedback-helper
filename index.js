@@ -36,6 +36,20 @@ if (!token || !appId || !guildId || !formChannelId || !suggestionsChannelId) {
 // =====================
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
+// In‑memory vote state: messageId -> { up:Set<userId>, down:Set<userId> }
+const voteState = new Map();
+function getVoteState(messageId) {
+  if (!voteState.has(messageId)) voteState.set(messageId, { up: new Set(), down: new Set() });
+  return voteState.get(messageId);
+}
+function buildVoteRow(messageId) {
+  const state = getVoteState(messageId);
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`vote:up:${messageId}`).setLabel(`👍 ${state.up.size}`).setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`vote:down:${messageId}`).setLabel(`👎 ${state.down.size}`).setStyle(ButtonStyle.Danger),
+  );
+}
+
 // (Optional) Deploy /feedback — not required for panel-only UX
 async function deployCommands() {
   const rest = new REST({ version: '10' }).setToken(token);
@@ -63,7 +77,8 @@ async function upsertPanel() {
       '',
       '• **Submit (with name)** posts your Discord tag with the suggestion.',
       '• **Submit Anonymously** hides your identity in the posted message.'
-    ].join('\n'))
+    ].join('
+'))
     .setColor(0x5865F2);
 
   const row = new ActionRowBuilder().addComponents(
@@ -109,7 +124,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.showModal(modal);
     }
 
-    // Modal submit → post to suggestions channel + emoji reactions starting at 0
+    // Modal submit → post to suggestions channel + attach button voting (starts at 0)
     if (interaction.isModalSubmit() && interaction.customId.startsWith('fb_modal:')) {
       const anon = interaction.customId.endsWith(':1');
       const text = interaction.fields.getTextInputValue('text')?.trim();
@@ -119,36 +134,66 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const out = await guild.channels.fetch(suggestionsChannelId);
       if (!out?.isTextBased()) return interaction.reply({ content: 'Config error: target suggestions channel is invalid.', flags: MessageFlags.Ephemeral });
 
-      // Work out a human-friendly server display name (nickname > server display > global > username)
-const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-const displayName = member?.nickname || member?.displayName || interaction.user.globalName || interaction.user.username;
+      // Display name: nickname > server display > global > username
+      const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const displayName = member?.nickname || member?.displayName || interaction.user.globalName || interaction.user.username;
 
-const embed = new EmbedBuilder()
-  .setTitle('New Suggestion')
-  .setDescription(text)
-  .setTimestamp(new Date())
-  .setFooter({ text: anon ? 'Submitted anonymously' : `Submitted by ${displayName}` });
+      const embed = new EmbedBuilder()
+        .setTitle('New Suggestion')
+        .setDescription(text)
+        .setTimestamp(new Date())
+        .setFooter({ text: anon ? 'Submitted anonymously' : `Submitted by ${displayName}` });
 
-      const message = await out.send({ embeds: [embed] });
-
-      // Emoji voting — add 👍/👎 and remove the bot's own reactions so counts start at 0
-      try {
-        await message.react('👍');
-        await message.react('👎');
-        const ensureRemoved = async (emoji) => {
-          try {
-            const current = message.reactions.cache.get(emoji) || (await message.fetch()).reactions.cache.get(emoji);
-            if (current) await current.users.remove(client.user.id);
-          } catch (err) {
-            console.warn(`Could not remove own reaction for ${emoji}:`, err?.message || err);
-          }
-        };
-        await Promise.allSettled([ensureRemoved('👍'), ensureRemoved('👎')]);
-      } catch (e) {
-        console.warn('Could not add/remove reactions (check permissions):', e?.message || e);
-      }
+      // Send first, then add the voting buttons with messageId in the customId
+      const sent = await out.send({ embeds: [embed] });
+      const row = buildVoteRow(sent.id);
+      await sent.edit({ components: [row] });
 
       return interaction.reply({ content: 'Thanks! Your suggestion was submitted.', flags: MessageFlags.Ephemeral });
+    }
+
+    // Handle voting button clicks
+    if (interaction.isButton() && interaction.customId.startsWith('vote:')) {
+      const [, dir, messageId] = interaction.customId.split(':'); // vote:up:123 or vote:down:123
+      if (!dir || !messageId) return interaction.deferUpdate();
+
+      const state = getVoteState(messageId);
+      const userId = interaction.user.id;
+
+      if (dir === 'up') {
+        if (state.up.has(userId)) {
+          state.up.delete(userId); // toggle off upvote
+        } else {
+          state.up.add(userId);
+          state.down.delete(userId); // enforce one direction at a time
+        }
+      } else if (dir === 'down') {
+        if (state.down.has(userId)) {
+          state.down.delete(userId); // toggle off downvote
+        } else {
+          state.down.add(userId);
+          state.up.delete(userId);
+        }
+      }
+
+      // Update the button labels with new counts
+      try {
+        const newRow = buildVoteRow(messageId);
+        // If the click happened on the target message, interaction.message is that message
+        if (interaction.message?.id === messageId) {
+          await interaction.message.edit({ components: [newRow] });
+        } else {
+          // Fallback: fetch and edit the original message
+          const channel = await interaction.guild.channels.fetch(suggestionsChannelId);
+          const msg = await channel.messages.fetch(messageId);
+          await msg.edit({ components: [newRow] });
+        }
+      } catch (e) {
+        console.warn('Could not edit message to update votes:', e?.message || e);
+      }
+
+      // No visible reply; just acknowledge to avoid "This interaction failed"
+      return interaction.deferUpdate();
     }
   } catch (err) {
     console.error('Interaction error:', err);
