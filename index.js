@@ -18,13 +18,19 @@ import {
 } from 'discord.js';
 
 // =====================
-// Env Vars
+// Env & Config
 // =====================
 const token = process.env.DISCORD_TOKEN;
 const appId = process.env.APP_ID;
 const guildId = process.env.GUILD_ID;
 const formChannelId = process.env.FORM_CHANNEL_ID; // Panel lives here
 const suggestionsChannelId = process.env.SUGGESTIONS_CHANNEL_ID; // Suggestions are posted here
+
+// Staff roles allowed to view detailed results (comma separated). Default to the provided role id.
+const STAFF_ROLE_IDS = (process.env.STAFF_ROLE_IDS ?? '1356279578200637490')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 if (!token || !appId || !guildId || !formChannelId || !suggestionsChannelId) {
   console.error('Missing env vars. Required: DISCORD_TOKEN, APP_ID, GUILD_ID, FORM_CHANNEL_ID, SUGGESTIONS_CHANNEL_ID');
@@ -36,7 +42,10 @@ if (!token || !appId || !guildId || !formChannelId || !suggestionsChannelId) {
 // =====================
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// In‑memory vote state: messageId -> { up:Set<userId>, down:Set<userId> }
+// =====================
+// Voting state (in-memory)
+// =====================
+// messageId -> { up: Set<userId>, down: Set<userId> }
 const voteState = new Map();
 function getVoteState(messageId) {
   if (!voteState.has(messageId)) voteState.set(messageId, { up: new Set(), down: new Set() });
@@ -47,10 +56,13 @@ function buildVoteRow(messageId) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`vote:up:${messageId}`).setLabel(`👍 ${state.up.size}`).setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`vote:down:${messageId}`).setLabel(`👎 ${state.down.size}`).setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`vote:view:${messageId}`).setLabel('View results').setStyle(ButtonStyle.Secondary),
   );
 }
 
+// =====================
 // (Optional) Deploy /feedback — not required for panel-only UX
+// =====================
 async function deployCommands() {
   const rest = new REST({ version: '10' }).setToken(token);
   const commands = [
@@ -64,7 +76,9 @@ async function deployCommands() {
   console.log('Slash commands deployed (guild).');
 }
 
+// =====================
 // Post/refresh the static panel in the form channel
+// =====================
 async function upsertPanel() {
   const guild = await client.guilds.fetch(guildId);
   const channel = await guild.channels.fetch(formChannelId);
@@ -75,9 +89,10 @@ async function upsertPanel() {
     .setDescription(
       `Click a button to open the form.
 
-    • **Submit (with name)** posts your Discord tag with the suggestion.
-    • **Submit Anonymously** hides your identity in the posted message.`
-  )
+• **Submit (with name)** posts your Discord tag with the suggestion.
+• **Submit Anonymously** hides your identity in the posted message.`
+    )
+    .setColor(0x5865F2);
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('fb_open:public').setLabel('Submit (with name)').setStyle(ButtonStyle.Primary),
@@ -102,6 +117,9 @@ client.once(Events.ClientReady, async (c) => {
   try { await upsertPanel(); } catch (e) { console.error('Failed to post panel:', e?.message || e); }
 });
 
+// =====================
+// Interactions
+// =====================
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     // (Optional) /feedback → show the same buttons ephemerally
@@ -150,38 +168,63 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.reply({ content: 'Thanks! Your suggestion was submitted.', flags: MessageFlags.Ephemeral });
     }
 
-    // Handle voting button clicks
+    // Handle voting button clicks (up / down / view)
     if (interaction.isButton() && interaction.customId.startsWith('vote:')) {
-      const [, dir, messageId] = interaction.customId.split(':'); // vote:up:123 or vote:down:123
-      if (!dir || !messageId) return interaction.deferUpdate();
+      const [, action, messageId] = interaction.customId.split(':'); // vote:up|down|view:messageId
+      if (!action || !messageId) return interaction.deferUpdate();
 
+      // VIEW RESULTS — staff only (ephemeral)
+      if (action === 'view') {
+        const isStaff = STAFF_ROLE_IDS.some((rid) => interaction.member?.roles?.cache?.has(rid));
+        if (!isStaff) {
+          return interaction.reply({ content: 'You are not authorized to view voting results.', flags: MessageFlags.Ephemeral });
+        }
+        const state = getVoteState(messageId);
+        const upIds = Array.from(state.up);
+        const downIds = Array.from(state.down);
+
+        const fetchNames = async (ids) => {
+          const names = await Promise.all(ids.map(async (id) => {
+            try {
+              const m = await interaction.guild.members.fetch(id);
+              return m?.displayName ?? m?.user?.username ?? 'Unknown';
+            } catch {
+              return 'Unknown';
+            }
+          }));
+          return names;
+        };
+
+        const upNames = await fetchNames(upIds);
+        const downNames = await fetchNames(downIds);
+
+        const summary = [
+          `👍 Upvotes (${upIds.length}):`,
+          upNames.length ? upNames.map(n => `• ${n}`).join('\n') : '• None',
+          '',
+          `👎 Downvotes (${downIds.length}):`,
+          downNames.length ? downNames.map(n => `• ${n}`).join('\n') : '• None',
+        ].join('\n');
+
+        return interaction.reply({ content: summary, flags: MessageFlags.Ephemeral });
+      }
+
+      // UP / DOWN voting logic
       const state = getVoteState(messageId);
       const userId = interaction.user.id;
 
-      if (dir === 'up') {
-        if (state.up.has(userId)) {
-          state.up.delete(userId); // toggle off upvote
-        } else {
-          state.up.add(userId);
-          state.down.delete(userId); // enforce one direction at a time
-        }
-      } else if (dir === 'down') {
-        if (state.down.has(userId)) {
-          state.down.delete(userId); // toggle off downvote
-        } else {
-          state.down.add(userId);
-          state.up.delete(userId);
-        }
+      if (action === 'up') {
+        if (state.up.has(userId)) { state.up.delete(userId); } else { state.up.add(userId); state.down.delete(userId); }
+      } else if (action === 'down') {
+        if (state.down.has(userId)) { state.down.delete(userId); } else { state.down.add(userId); state.up.delete(userId); }
       }
 
       // Update the button labels with new counts
       try {
         const newRow = buildVoteRow(messageId);
-        // If the click happened on the target message, interaction.message is that message
         if (interaction.message?.id === messageId) {
           await interaction.message.edit({ components: [newRow] });
         } else {
-          // Fallback: fetch and edit the original message
           const channel = await interaction.guild.channels.fetch(suggestionsChannelId);
           const msg = await channel.messages.fetch(messageId);
           await msg.edit({ components: [newRow] });
@@ -190,8 +233,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         console.warn('Could not edit message to update votes:', e?.message || e);
       }
 
-      // No visible reply; just acknowledge to avoid "This interaction failed"
-      return interaction.deferUpdate();
+      return interaction.deferUpdate(); // acknowledge without a visible reply
     }
   } catch (err) {
     console.error('Interaction error:', err);
